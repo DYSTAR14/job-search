@@ -47,8 +47,9 @@ def setup_logging():
 
 CSV_COLUMNS = [
     "source", "company", "role", "location", "state_region", "experience",
-    "email", "apply_url", "apply_type", "other_links", "how_to_apply", "age",
-    "post_url", "score", "description",
+    "ctc", "notice_period", "work_mode", "job_type",
+    "email", "phone", "apply_url", "apply_type", "other_links", "how_to_apply",
+    "apply_instruction", "age", "post_url", "score", "description",
 ]
 
 
@@ -140,6 +141,8 @@ def md_apply_line(post):
     if post.get("apply_url"):
         desc = links.KINDS[post["apply_kind"]][1]
         parts.append(f"🔗 {desc}: {post['apply_url']}")
+    if post.get("phones"):
+        parts.append(f"📱 {', '.join(post['phones'])}")
     if parts:
         return "  ·  ".join(parts)
     if post.get("no_real_apply_path"):
@@ -188,11 +191,17 @@ def write_outputs(posts, warnings, window_hours):
                 "location": p.get("location", ""),
                 "state_region": "; ".join(p.get("locations", [])),
                 "experience": p.get("experience", ""),
+                "ctc": p.get("ctc", ""),
+                "notice_period": p.get("notice_period", ""),
+                "work_mode": p.get("work_mode", ""),
+                "job_type": p.get("job_type", ""),
                 "email": p.get("email", ""),
+                "phone": ", ".join(p.get("phones", [])),
                 "apply_url": p.get("apply_url", ""),
                 "apply_type": links.KINDS[p["apply_kind"]][1] if p.get("apply_kind") else "",
                 "other_links": other_links_str(p),
                 "how_to_apply": how_to_apply(p),
+                "apply_instruction": p.get("apply_instruction", ""),
                 "age": age_to_str(p.get("age")),
                 "post_url": p.get("post_url") or "",
                 "score": p.get("score", 0),
@@ -236,13 +245,25 @@ def write_outputs(posts, warnings, window_hours):
                     company += " (from email)"
                 f.write(f"### {i}. {p.get('role', '?')} — {company} (score {p.get('score', 0)})\n")
                 f.write(f"- **Apply:** {md_apply_line(p)}\n")
+                if p.get("apply_instruction"):
+                    f.write(f"- **How to apply (from post):** {p['apply_instruction']}\n")
                 if p.get("post_url"):
                     f.write(f"- **Post link:** {p['post_url']}\n")
-                f.write(f"- **Location:** {p.get('location') or '—'}\n")
+                location = p.get("location")
+                if not location:
+                    location = ", ".join((p.get("locations") or [])[:1]) + " (inferred from post text)"
+                f.write(f"- **Location:** {location}\n")
                 other_regions = (p.get("locations") or [])[1:]
                 if other_regions:
                     f.write(f"- **Also relevant to:** {', '.join(other_regions)}\n")
                 f.write(f"- **Experience:** {p.get('experience') or '—'}\n")
+                details = [
+                    f"{label} {p[key]}" for label, key in
+                    (("CTC:", "ctc"), ("Notice:", "notice_period"), ("Mode:", "work_mode"), ("Type:", "job_type"))
+                    if p.get(key)
+                ]
+                if details:
+                    f.write(f"- **Details:** {'  ·  '.join(details)}\n")
                 f.write(f"- **Posted:** {age_to_str(p.get('age')) or '—'} ago\n")
                 desc = (p.get("description") or "").strip()
                 if desc:

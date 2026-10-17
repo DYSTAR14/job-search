@@ -135,7 +135,7 @@ def extract_labeled_fields(text):
                     # preferred. 5+ years experience") - cut at the first
                     # sentence boundary so we don't swallow unrelated facts.
                     value = re.split(r"(?<=\S)\.\s", value)[0]
-                fields[key] = value.strip().rstrip(".,")
+                fields[key] = clean_field_value(value.strip().rstrip(".,"))
     email_match = EMAIL_RE.search(text)
     if email_match:
         fields["email"] = clean_email(email_match.group(0))
@@ -216,14 +216,116 @@ MORE_TOGGLE_RE = re.compile(r"\s*…\s*more\s*", re.IGNORECASE)
 BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
+ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u2800]")
+# The reaction/comment count LinkedIn renders after the post body ("#TCS 4",
+# "...@firm.com 36", or a bare "2" on its own last line). All 42 posts in one
+# audited scan ended with one of these, plus zero-width spacer lines.
+TRAILING_COUNT_RE = re.compile(
+    r"(?:(?<=[^\s:\-\u2013\u2014])[ \t]+|\n+[ \t]*)\d{1,5}(?:[ \t]*(?:comments?|reposts?|likes?))*\s*$",
+    re.IGNORECASE,
+)
+
+
 def clean_description(text):
     """Strip LinkedIn's UI chrome out of a post's raw body text so it reads
     as an actual job description rather than a DOM dump.
     """
-    cleaned = TRAILING_ACTION_BAR_RE.sub("", text)
+    cleaned = ZERO_WIDTH_RE.sub("", text)
+    cleaned = TRAILING_ACTION_BAR_RE.sub("", cleaned.rstrip())
     cleaned = MORE_TOGGLE_RE.sub(" ", cleaned)
+    # Reactions and comments render as separate trailing numbers ("4\n1"),
+    # so strip repeatedly until nothing more comes off.
+    for _ in range(4):
+        stripped = TRAILING_COUNT_RE.sub("", cleaned.rstrip())
+        if stripped == cleaned.rstrip():
+            break
+        cleaned = stripped
     cleaned = BLANK_LINES_RE.sub("\n\n", cleaned)
     return cleaned.strip()
+
+
+def clean_field_value(value):
+    """Tidy a labeled field value: drop markdown bold markers, emoji and
+    stray brackets glued onto the ends ("** 6-12 Years", "Bangalore💼",
+    "[Muzaffarpur/Jaipur]", "Noida or New Delhi ?")."""
+    value = ZERO_WIDTH_RE.sub("", value).replace("*", "")
+    value = re.sub(r"^[^\w(\[]+|[^\w)\]+#.]+$", "", value.strip())
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return re.sub(r"\s+", " ", value).strip()
+
+
+PHONE_RE = re.compile(r"(?<![\d])(?:\+?91[\s-]?)?([6-9]\d{4})[\s-]?(\d{5})(?!\d)")
+CTC_LABEL_RE = re.compile(
+    r"^(?:ctc|salary|compensation|package|budget|pay(?:\s*range)?|rate)(?:\s*range)?\s*[:\-]\s*(.+)$",
+    re.IGNORECASE,
+)
+CTC_INLINE_RE = re.compile(
+    r"(?:\u20b9|rs\.?|inr)\s?[\d.,]+\s?(?:-|\u2013|to)?\s?[\d.,]*\s?(?:lpa|lakhs?|k|per month|/month)"
+    r"|\b\d{1,3}(?:\.\d)?\s?(?:-|\u2013|to)\s?\d{1,3}(?:\.\d)?\s?lpa\b",
+    re.IGNORECASE,
+)
+APPLY_INSTRUCTION_RE = re.compile(
+    r"(?:send|share|drop|forward|email|e-mail|mail)\b.*\b(?:resume|cv|profile)"
+    r"|\b(?:dm|comment|whatsapp|connect with me)\b"
+    r"|interested candidates?"
+    r"|apply\s+(?:now|here|via|at|through|on|using)",
+    re.IGNORECASE,
+)
+WORK_MODE_TERMS = [
+    ("Remote", r"\bremote\b|\bwfh\b|work from home"),
+    ("Hybrid", r"\bhybrid\b"),
+    ("Onsite", r"\bon-?site\b|\bwfo\b|work from office"),
+]
+JOB_TYPE_TERMS = [
+    ("Contract-to-hire", r"contract[\s-]*to[\s-]*hire|\bc2h\b"),
+    ("Contract", r"\bcontract\b|\bc2c\b"),
+    ("Full-time", r"\bfull[\s-]*time\b|\bpermanent\b|\bfte\b"),
+    ("Freelance", r"\bfreelanc"),
+    ("Part-time", r"\bpart[\s-]*time\b"),
+]
+
+
+def extract_phones(text):
+    """Indian mobile numbers in the post (apply-by-call/WhatsApp), deduped."""
+    found = []
+    for m in PHONE_RE.finditer(text):
+        number = m.group(1) + m.group(2)
+        if number not in found:
+            found.append(number)
+    return found[:3]
+
+
+def extract_apply_instruction(text):
+    """The post's own sentence on how to apply (e.g. "Share your resume at
+    ..." / "DM me your CV"), so the report can show it without reading the
+    whole description."""
+    for line in text.splitlines():
+        line = LEADING_SYMBOLS_RE.sub("", ZERO_WIDTH_RE.sub("", line)).strip()
+        if 12 <= len(line) <= 400 and APPLY_INSTRUCTION_RE.search(line) and not line.startswith("#"):
+            return line[:220]
+    return ""
+
+
+def extract_details(text, fields):
+    """Decision-making basics that live in the post body: pay, notice
+    period, work mode and employment type."""
+    ctc = ""
+    for line in text.splitlines():
+        m = CTC_LABEL_RE.match(LEADING_SYMBOLS_RE.sub("", line.strip()))
+        if m:
+            ctc = clean_field_value(m.group(1))[:120]
+            break
+    if not ctc:
+        m = CTC_INLINE_RE.search(text)
+        ctc = m.group(0).strip() if m else ""
+    lower = text.lower()
+    return {
+        "ctc": ctc,
+        "notice_period": fields.get("notice_period", ""),
+        "work_mode": " / ".join(name for name, pat in WORK_MODE_TERMS if re.search(pat, lower)),
+        "job_type": " / ".join(name for name, pat in JOB_TYPE_TERMS if re.search(pat, lower)),
+    }
 
 
 def normalize_company(name):
@@ -553,8 +655,19 @@ def process_posts(raw_posts, config):
         enriched["company"] = company
         enriched["location"] = location
         enriched["locations"] = locations
-        enriched["experience"] = fields.get("experience", "")
+        experience = fields.get("experience", "")
+        if not experience:
+            # Narrative posts ("4+ years of hands-on experience...", a
+            # "(3+ Years)" in the title) have no "Exp:" line - take the
+            # stated years from the text so the report isn't blank.
+            exp_m = EXP_RANGE_RE.search(text)
+            if exp_m:
+                experience = clean_field_value(exp_m.group(0))
+        enriched["experience"] = experience
         enriched["email"] = fields.get("email", "")
+        enriched["phones"] = extract_phones(text)
+        enriched["apply_instruction"] = extract_apply_instruction(text)
+        enriched.update(extract_details(text, fields))
         enriched["description"] = clean_description(text)
         enriched["score"] = score_post(text_lower, fields, config)
         results.append(enriched)
