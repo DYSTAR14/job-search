@@ -1,0 +1,310 @@
+# LinkedIn-only job-post scan config.
+# Edit queries / keywords / locations to taste — no code changes needed.
+
+browser:
+  channel: chrome          # use real installed Chrome, not bundled Chromium
+  profile_dir: profile/linkedin
+  headless: false          # must stay false: Task Scheduler needs an interactive desktop session
+
+# When true, clicks each new post's "..." menu -> "Copy link to post" to get
+# the real post permalink (needed for posts with no email - otherwise the
+# only link available is the author/company profile, not the actual post).
+# This is a new interaction type beyond scrolling/reading, so it's a toggle:
+# set false to fall back to the author/company profile link only.
+capture_post_links: true
+# Safety cap: even with capture_post_links on, stop clicking after this many
+# permalink captures within a single query. A query's volume can spike
+# unexpectedly (one test run hit 234 posts for a single phrase) - this
+# bounds how much "..." menu interaction happens in a worst case.
+# Lowered from 15 to 8 on 2026-10-07: that day's run fired all 15 captures
+# within about a minute (each only 0.8-1.8s apart at the time), right before
+# LinkedIn flagged "unusual search traffic" on the very next query. The
+# per-capture delay was widened to 2.0-4.5s in linkedin.py at the same time;
+# this cap shortens how long that rapid open-menu/copy-link/clipboard-read
+# pattern runs in total.
+max_permalink_captures_per_query: 8
+
+# Once a job opening (keyed by contact email, or company+role if no email)
+# has been shown in the output, suppress it from showing again for this many
+# days even if a different person reposts it - prevents the same opening
+# resurfacing daily. Tracked in reported.json.
+dedup_window_days: 7
+
+window_hours: 24
+
+queries:
+  - "hiring for java developer"
+  - "hiring for spring boot"
+  - "hiring for genai engineer"
+  - "hiring for backend developer"
+  - "hiring for langchain"
+  - "hiring for agentic ai"
+  - "hiring for llm engineer"
+  - "urgent hiring java developer"
+  - "urgent hiring spring boot developer"
+  - "hiring for mcp"
+  - "hiring for langgraph"
+  - "hiring for rag engineer"
+
+# Both ends are enforced: a post whose lowest stated requirement is above
+# max_years is dropped (too senior), and one whose highest stated
+# requirement is below min_years is dropped (fresher/junior-only - previously
+# not enforced at all, so e.g. "0-2 yrs" posts could slip through).
+experience:
+  min_years: 3
+  max_years: 7
+
+include_keywords:
+  - java
+  - spring
+  - spring boot
+  - backend
+  - genai
+  - langchain
+  - langgraph
+  - agentic
+  - llm
+  - mcp
+  - rag
+  - model context protocol
+
+# Substring match anywhere in the post text -> post is dropped.
+exclude_keywords:
+  - c2c
+  - w2
+  - h1b
+  - job seeker
+  - looking for job
+  - looking for opportunities
+  - intern
+  - internship
+# Countries outside India - a post mentioning one of these is dropped UNLESS
+# it's explicitly WFH/remote-from-India (bare "remote" alone does NOT
+# qualify - that's the word that let Canada/Pakistan/Singapore posts slip
+# through before, since "remote within Canada" also says "remote"; it needs
+# an explicit WFH phrase, or "remote" combined with an explicit India
+# mention). See is_foreign_post_wfh() in classify.py.
+foreign_country_signals:
+  - usa only
+  - usa
+  - us citizens
+  - us citizen
+  - united states
+  - canada
+  - canadian
+  - pakistan
+  - islamabad
+  - karachi
+  - lahore
+  - bangladesh
+  - dhaka
+  - nepal
+  - kathmandu
+  - sri lanka
+  - colombo
+  - singapore
+  - dubai
+  - uae
+  - saudi
+  - qatar
+  - kuwait
+  - philippines
+  - manila
+  - united kingdom
+  - uk
+  - london
+  - germany
+  - berlin
+  - australia
+  - sydney
+  - melbourne
+  # Added 2026-10-17: a Dublin-based "Remote Java Developer" posting got
+  # through because only the countries above were listed. Wider Europe /
+  # APAC / Americas / Africa coverage, plus major US cities & states.
+  - ireland
+  - dublin
+  - hungary
+  - budapest
+  - poland
+  - warsaw
+  - netherlands
+  - amsterdam
+  - france
+  - paris
+  - spain
+  - madrid
+  - italy
+  - switzerland
+  - zurich
+  - sweden
+  - stockholm
+  - norway
+  - denmark
+  - copenhagen
+  - finland
+  - belgium
+  - brussels
+  - austria
+  - vienna
+  - portugal
+  - lisbon
+  - romania
+  - bucharest
+  - ukraine
+  - czech
+  - prague
+  - brazil
+  - mexico
+  - latam
+  - emea
+  - japan
+  - tokyo
+  - china
+  - hong kong
+  - malaysia
+  - kuala lumpur
+  - indonesia
+  - thailand
+  - bangkok
+  - vietnam
+  - south africa
+  - nigeria
+  - kenya
+  - egypt
+  - israel
+  - new zealand
+
+# Weaker foreign signals: US cities/states that also appear inside company
+# names on genuine India postings (Texas Instruments, Boston Consulting
+# Group, New York Life...). A post mentioning one is dropped only if it has
+# NO Indian city/state anywhere in it. ("jakarta" is deliberately absent from
+# both lists: "Jakarta EE" is a core Java term in many on-target posts.)
+foreign_weak_signals:
+  - new york
+  - san francisco
+  - texas
+  - california
+  - new jersey
+  - chicago
+  - seattle
+  - atlanta
+  - boston
+
+# Role-title stack filter (checked against the extracted ROLE only, anywhere
+# in the title - exclude_role_prefixes below only sees the start, so "Sr.
+# Backend .NET Developer" slipped through). A role naming one of these is
+# dropped unless it ALSO names something from role_keep_keywords, so
+# "Java Full Stack (Java + Angular)" survives but "Node.js Backend Developer"
+# does not.
+exclude_role_keywords:
+  - .net
+  - dotnet
+  - node.js
+  - nodejs
+  - node js
+  - node
+  - php
+  - ruby
+  - golang
+  - c#
+  - angular
+  - react
+  - react.js
+  - flutter
+  - android
+  - ios
+  - salesforce
+  - sap
+  - mern
+  - mean
+role_keep_keywords:
+  - java
+  - spring
+  - python
+  - ai
+  - genai
+  - agentic
+  - llm
+  - langchain
+  - langgraph
+  - mcp
+  - rag
+
+# Posts asking the candidate to pay anything (registration/processing fee,
+# refundable deposit, etc.) are dropped outright, regardless of score.
+# Falls back to classify.py's SCAM_KEYWORDS if this is left empty/removed.
+scam_keywords:
+  - charges applicable
+  - registration fee
+  - registration charges
+  - processing fee
+  - security deposit
+  - refundable deposit
+  - refundable fee
+  - pay to apply
+  - token amount
+  - advance payment
+  - small fee
+  - nominal fee
+  - one-time fee
+
+# If the extracted ROLE starts with any of these -> post is dropped.
+# (checked against the parsed role, not the raw post text)
+exclude_role_prefixes:
+  - angular
+  - react
+  - .net
+  - dotnet
+  - lead
+  - manager
+  - architect
+
+# Location filtering is now handled in code (classify.py's STATE_PATTERNS +
+# foreign_country_signals above), covering all Indian states/UTs plus the
+# WFH-from-India exception for foreign-client postings. No config list here
+# needed - edit STATE_PATTERNS directly if a city/region is missing.
+
+skip_companies: []
+
+# max_scroll_steps lowered from 30 to 15 on 2026-10-08. Evidence from the
+# 2026-10-06/07/08 logs ruled out in-session click/scroll pacing as the
+# cause of the "unusual search traffic" block (the 10-06 evening run was
+# faster-paced AND pulled more raw posts per query than the two days that
+# got blocked, and still went through clean) - so this isn't about how fast
+# we click within one query. External research on LinkedIn's automation
+# detection points to cumulative daily/weekly activity volume vs. the
+# account's historical baseline as the real signal, not per-session
+# micro-timing. This account has been running ~12 keyword searches with
+# deep scrolling every day for a week (plus a same-day double run on
+# 10-06), which is a large, sustained jump from a normal browsing pattern.
+# Halving the scroll cap halves the worst-case raw-post volume per query
+# (and therefore per day) as a direct lever on that signal. Pair this with
+# NOT running more than once a day, and taking occasional days off entirely
+# - no in-page timing fix addresses a cumulative, account-level pattern.
+pacing:
+  scroll_delay_min: 4
+  scroll_delay_max: 9
+  query_delay_min: 20
+  query_delay_max: 40
+  max_scroll_steps: 15
+  stale_scroll_limit: 3
+
+# Phrases checked (case-insensitive) against the full page text after every
+# navigation/scroll. Any match stops the run immediately.
+block_signals:
+  - unusual activity
+  - unusual search traffic
+  - search activity on your account has been paused
+  - we've restricted
+  - checkpoint/challenge
+  - commercial use limit
+  - verify you're not a robot
+  - security verification
+
+# Apply-link analysis (links.py): posts without an email usually apply via a
+# link, mostly opaque lnkd.in shorteners. When on, each surviving post's links
+# are resolved (shortener hosts only, logged-out, cached in link_cache.json)
+# and classified as application form / company ATS / LinkedIn job / job board
+# / community / aggregator, so the report shows the real apply path.
+resolve_links: true
+max_link_resolutions_per_run: 60

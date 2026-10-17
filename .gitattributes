@@ -1,0 +1,6 @@
+# Store text as LF in the repo; check out with the platform default (CRLF on Windows).
+* text=auto
+
+# Binary files: never convert.
+*.pdf binary
+*.png binary

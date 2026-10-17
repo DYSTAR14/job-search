@@ -1,0 +1,27 @@
+# Logged-in Chrome profile: LinkedIn session cookies. Never commit.
+profile/
+
+# Python / environment
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state (rebuilt by running the scanner)
+seen.json
+reported.json
+link_cache.json
+logs/
+debug/
+
+# Scraped output: third-party recruiter emails/phone numbers, plus personal
+# shortlists. Keep local.
+output/
+
+# Personal documents
+*.pdf
+
+# Unrelated side project living in the same folder
+html_to_pdf_extraction/
+
+# Scratch files used during analysis
+scratch_*
