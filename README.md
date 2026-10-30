@@ -81,7 +81,9 @@ Everything that affects what gets kept is in `config.yaml`:
 - `exclude_role_prefixes` — drop by role title (Angular/React/.NET-first, etc.)
 - `location_allow` — keep only posts mentioning one of these
 - `experience` — hard cap on minimum years required
-- `pacing` — scroll/query delays, scroll step cap
+- `pacing` — scroll/query delays; dynamic scroll depth (`max_scroll_steps` ceiling, `yield_window`, `run_scroll_budget`)
+- `deep_queries` — per-query override: scroll until results run out (`max_scroll_steps`, `max_posts`)
+- `allow_foreign_remote` — also keep foreign remote jobs (shown as "Remote (International)", with an eligibility note); foreign on-site/hybrid stay dropped
 
 Role, company, experience and location are extracted with regex, not fixed
 fields — many recruiter posts are templated ("Role:", "Exp:", "Location:")

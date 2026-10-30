@@ -21,7 +21,10 @@ from collections import Counter
 # "Roles:") especially when listing multiple options on one line.
 LABEL_LINE_PATTERNS = {
     "role": r"(?:roles?|positions?|titles?|designations?)\s*[:\-]\s*(.+)",
-    "experience": r"(?:exp(?:erience)?s?(?:\s+required)?)\s*[:\-]\s*(.+)",
+    "experience": r"(?:(?:total|overall|minimum|min\.?|required|work|professional)\s+)?(?:exp(?:erience)?s?(?:\s+required)?)\s*[:\-]\s*(.+)",
+    # "Total Experience: 8 Years / Relevant Experience: 5 Years" - the relevant
+    # figure is what the role needs, so it is preferred (see extract_labeled_fields)
+    "experience_relevant": r"(?:relevant|rel\.?)\s+exp(?:erience)?s?\s*[:\-]\s*(.+)",
     "location": r"(?:locations?|loc)\s*[:\-]\s*(.+)",
     "notice_period": r"notice\s*periods?\s*[:\-]\s*(.+)",
 }
@@ -136,6 +139,10 @@ def extract_labeled_fields(text):
                     # sentence boundary so we don't swallow unrelated facts.
                     value = re.split(r"(?<=\S)\.\s", value)[0]
                 fields[key] = clean_field_value(value.strip().rstrip(".,"))
+    relevant = fields.pop("experience_relevant", None)
+    if relevant:
+        total = fields.get("experience")
+        fields["experience"] = f"{relevant} ({total} total)" if total else relevant
     email_match = EMAIL_RE.search(text)
     if email_match:
         fields["email"] = clean_email(email_match.group(0))
@@ -161,6 +168,56 @@ def extract_fallback_role(text):
         # there's no usable role text to extract, so drop it rather than
         # show a hashtag string as the "role".
         return None
+    return _tidy_sentence_role(tail)
+
+
+ARTICLE_LEAD_RE = re.compile(r"^(?:an?|the)\s+(?:new\s+)?", re.IGNORECASE)
+# End of the first sentence, but not the period of "Sr." / "Jr."
+SENTENCE_END_RE = re.compile(r"(?<!\bSr)(?<!\bJr)(?<!\bsr)(?<!\bjr)[.!?](?:\s|$)")
+# Where a "hiring a <role> ..." sentence moves on from the title to the
+# place / client / team ("... Developer in Pune", "... Engineer for a UK client").
+ROLE_TAIL_RE = re.compile(r"\s+(?:in|at|for|while|where|who|to join)\s+", re.IGNORECASE)
+# Only unmistakable sentence verbs: plain "is"/"are" also occur in real
+# posts where the title simply runs on into the next sentence.
+SENTENCE_VERB_RE = re.compile(r"\b(?:isn't|aren't|doesn't|don't|focuses)\b", re.IGNORECASE)
+# The title runs on into a new sentence on the same line:
+# "Java Developer | 5+ Yrs We are looking for ...", "AI Engineer ValueLabs is looking for ..."
+RUNON_RE = re.compile(
+    r"(?<!\w)(?:We(?:'re| are)?|Were|Our|This|Join|Apply)(?!\w)"
+    r"|(?<!\w)[A-Z][\w.&-]*\s+(?:is|are)\s+(?:looking|hiring|seeking|expanding)"
+)
+IS_HIRING_RE = re.compile(r"\b(?:is|are)\s+(?:hiring|looking\s+for|seeking)\s+", re.IGNORECASE)
+
+
+def _tidy_sentence_role(tail):
+    """Turn what follows an anchor like "hiring"/"looking for" into a title.
+
+    Headline-style text ("Java Backend Developer | 5+ Yrs | Bangalore") is only
+    truncated. Sentence-style text ("a new Agentic AI Engineer in Chennai,
+    Tamil Nadu. Apply today ...") loses its article, and is cut at the first
+    sentence end and at the place/client clause. If what is left still reads
+    like a sentence it is not a job title (e.g. "... isn't interchangeable"),
+    so None is returned and the post is dropped as having no role.
+    """
+    # "NOW: Deloitte is hiring a Java Developer ..." -> what follows "is hiring"
+    lead = IS_HIRING_RE.search(tail)
+    if lead:
+        tail = tail[lead.end():]
+    had_article = bool(ARTICLE_LEAD_RE.match(tail))
+    tail = ARTICLE_LEAD_RE.sub("", tail)
+    end = SENTENCE_END_RE.search(tail)
+    if end:
+        tail = tail[: end.start()]
+    runon = RUNON_RE.search(tail, 1)
+    if runon:
+        tail = tail[: runon.start()]
+    if had_article or len(tail) > 60:
+        cut = ROLE_TAIL_RE.search(tail)
+        if cut:
+            tail = tail[: cut.start()]
+        tail = tail.strip()
+        if len(tail) > 45 and SENTENCE_VERB_RE.search(tail):
+            return None
     return tail[:80] or None
 
 
@@ -176,11 +233,19 @@ def normalize_entities(text):
     return MISSING_AMP_RE.sub("&", text)
 
 
+LEADING_TAG_RE = re.compile(
+    r"^(?:job\s+alert|alert|urgent(?:ly)?(?:\s+hiring)?|hiring|opening|vacancy|immediate\s+joiners?)\s*[|:\-–—]\s*",
+    re.IGNORECASE,
+)
+
+
 def clean_role(role):
     """Strip decorations from an extracted role title: leading '#', trailing
     emoji/symbols (alert sirens, rockets), non-breaking spaces."""
     role = role.replace(" ", " ")
     role = LEADING_ROLE_JUNK_RE.sub("", role)
+    # "Alert | Java Developer", "Urgent Hiring: Backend Engineer" -> the title
+    role = LEADING_TAG_RE.sub("", role)
     role = re.sub(r"[^\w)\]+#]+$", "", role)
     return re.sub(r"\s+", " ", role).strip()
 
@@ -193,17 +258,59 @@ def _is_hashtag_dump(text):
     return hash_tokens >= max(2, len(tokens) // 2)
 
 
-def parse_experience_years(text_or_none):
+EXP_MIN_RE = re.compile(r"(?:minimum|min\.?|at\s+least)\s+(?:of\s+)?(\d{1,2})\s*\+?\s*(?:yrs?|years?)", re.IGNORECASE)
+# A lone "8 Years" (not part of a range): only trusted inside a labeled
+# "Experience:" value - in free text it is usually about one specific skill.
+EXP_SINGLE_RE = re.compile(r"(?<![\d.\-–—])(\d{1,2})(?:\.\d)?\s*(?:yrs?|years?)\b", re.IGNORECASE)
+EXP_RANGE_UNITS_TWICE_RE = re.compile(
+    r"(\d{1,2})\s*(?:yrs?|years?)\s*(?:-|–|—|to)\s*(\d{1,2})\s*(?:yrs?|years?)", re.IGNORECASE
+)
+EXP_UP_TO_RE = re.compile(r"up\s*to\s*(\d{1,2})\s*(?:yrs?|years?)", re.IGNORECASE)
+EXP_RELEVANT_RE = re.compile(r"\(?\s*(\d{1,2})\s*(?:yrs?|years?)\s*(?:of\s+)?relevant", re.IGNORECASE)
+EXP_MONTHS_RE = re.compile(r"\d{1,2}(?:\s*[-–—]\s*\d{1,2})?\s*months?\b", re.IGNORECASE)
+EXP_YEARS_WORD_RE = re.compile(r"\b(?:yrs?|years?)\b", re.IGNORECASE)
+
+
+def experience_bands(text_or_none, labeled=False):
+    """Every (low, high) experience band stated in text; high is None for
+    open-ended ones ("5+ years", "minimum 2 years"). `labeled` means the text
+    is the value of an "Experience:" line, which also allows a lone "8 Years"
+    and a months-only value ("6 Months", "3-6 Months" = a fresher post, band
+    (0, 0))."""
     if not text_or_none:
+        return []
+    bands = [(int(a), int(b) if b else None) for a, b in EXP_RANGE_RE.findall(text_or_none)]
+    if bands:
+        return bands
+    # "2 Years - 5 Years": the unit is written twice, so EXP_RANGE_RE misses it
+    bands = [(int(a), int(b)) for a, b in EXP_RANGE_UNITS_TWICE_RE.findall(text_or_none)]
+    if bands:
+        return bands
+    m = EXP_UP_TO_RE.search(text_or_none)
+    if m:  # "up to 8 years" is a ceiling, not a requirement of 8
+        return [(0, int(m.group(1)))]
+    m = EXP_MIN_RE.search(text_or_none)
+    if m:
+        return [(int(m.group(1)), None)]
+    if labeled:
+        if EXP_MONTHS_RE.search(text_or_none) and not EXP_YEARS_WORD_RE.search(text_or_none):
+            return [(0, 0)]
+        # "12 Years (8 Years Relevant)": the relevant figure is what counts
+        rel = EXP_RELEVANT_RE.search(text_or_none)
+        if rel:
+            return [(int(rel.group(1)), int(rel.group(1)))]
+        # otherwise the first number only
+        return [(int(n), int(n)) for n in EXP_SINGLE_RE.findall(text_or_none)][:1]
+    return []
+
+
+def parse_experience_years(text_or_none, labeled=False):
+    bands = experience_bands(text_or_none, labeled)
+    if not bands:
         return None, None
-    m = EXP_RANGE_RE.search(text_or_none)
-    if not m:
-        return None, None
-    lo = int(m.group(1))
     # hi is None for open-ended "5+ years" - there is no stated maximum, so
     # callers must not treat it as an upper bound.
-    hi = int(m.group(2)) if m.group(2) else None
-    return lo, hi
+    return bands[0]
 
 
 # Matches the action-bar button labels LinkedIn always appends at the very
@@ -416,6 +523,53 @@ def is_foreign_post_wfh(text_lower):
     return "remote" in text_lower and "india" in text_lower
 
 
+# Foreign REMOTE jobs (config allow_foreign_remote): wanted, because they can
+# be done from India. Foreign on-site / hybrid jobs are still dropped.
+OVERSEAS_REMOTE = "Remote (International)"
+REMOTE_RE = re.compile(r"\b(?:remote(?:ly)?|work\s+from\s+(?:home|anywhere)|wfh|telecommut\w*)\b", re.IGNORECASE)
+NOT_REMOTE_RE = re.compile(
+    r"\b(?:no|not|non)[\s-]+remote\b|\bon[\s-]?site\s+only\b|\bno\s+wfh\b"
+    r"|\bremote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|possible|allowed)\b",
+    re.IGNORECASE,
+)
+# "Hybrid (2 days remote)" is not a remote job unless it also says it is fully remote.
+HYBRID_RE = re.compile(r"\b(?:hybrid|on[\s-]?site|in[\s-]office|office[\s-]based|work\s+from\s+office|wfo)\b", re.IGNORECASE)
+FULLY_REMOTE_RE = re.compile(
+    r"\b(?:fully|100%|completely|entirely)\s+remote\b|\bremote[\s-](?:first|only)\b|\bwork\s+from\s+anywhere\b",
+    re.IGNORECASE,
+)
+
+
+def is_remote_post(text):
+    if not REMOTE_RE.search(text) or NOT_REMOTE_RE.search(text):
+        return False
+    return bool(FULLY_REMOTE_RE.search(text)) or not HYBRID_RE.search(text)
+
+
+# Wording that often means a foreign remote job is only open to people already
+# based in / allowed to work in that country - flagged, not dropped, so you can
+# decide. Time-zone overlap is flagged too (it can mean night shifts from India).
+RESIDENCY_RE = re.compile(
+    r"(?:must|should|need\s+to)\s+(?:be\s+)?(?:located|based|residing|resident|living)\s+(?:in|within)\s+[^.\n]{0,40}"
+    r"|(?:work|working)\s+authori[sz]ation[^.\n]{0,30}"
+    r"|right\s+to\s+work[^.\n]{0,30}"
+    r"|(?:eligible|authori[sz]ed|legally\s+(?:entitled|allowed))\s+to\s+work\s+(?:in|within)\s+[^.\n]{0,30}"
+    r"|\b(?:us|u\.s\.|uk|eu|canadian|european)\s+(?:citizens?|residents?|nationals?)\b[^.\n]{0,20}"
+    r"|\bcitizens?\s+only\b"
+    r"|remote\s+(?:only\s+)?(?:within|in|across|from)\s+(?:the\s+)?"
+    r"(?:europe|eu|emea|usa?|u\.s\.a?|uk|canada|north\s+america|latam|latin\s+america|apac|germany|australia)\b"
+    r"|(?:no|without)\s+visa\s+sponsorship|visa\s+sponsorship\s+(?:is\s+)?not\s+(?:available|provided)"
+    r"|(?:overlap|align)\w*\s+(?:with\s+)?[^.\n]{0,30}(?:time\s*zone|hours|\best\b|\bpst\b|\bcet\b|\bgmt\b)[^.\n]{0,15}",
+    re.IGNORECASE,
+)
+
+
+def find_remote_restriction(text):
+    """First residency / work-authorization / time-zone phrase in the post, or ''."""
+    m = RESIDENCY_RE.search(text)
+    return re.sub(r"\s+", " ", m.group(0)).strip(" ,;:-")[:80] if m else ""
+
+
 def build_loose_terms_regex(terms):
     """Like build_terms_regex but for terms that start/end with symbols
     (".net", "c#") where \b cannot anchor - uses non-word lookarounds."""
@@ -441,7 +595,7 @@ def build_terms_regex(terms):
 # not listed here falls back to alphabetical. Catch-alls always go last.
 STATE_ORDER = [
     "Karnataka", "Maharashtra", "Telangana", "Tamil Nadu", "Delhi NCR",
-    "WFH (Overseas Client)", "Pan-India", "Remote", "Other",
+    "Remote (International)", "Pan-India", "Remote", "Other",
 ]
 
 
@@ -468,7 +622,7 @@ def strip_diacritics(text):
 
 def extract_locations(location, text_lower, is_wfh_overseas):
     if is_wfh_overseas:
-        return ["WFH (Overseas Client)"]
+        return [OVERSEAS_REMOTE]
     haystack = strip_diacritics(f"{location} {text_lower}")
     found = [state for state, rx in STATE_REGEXES.items() if rx.search(haystack)]
     if not found:
@@ -504,11 +658,20 @@ def score_post(text_lower, fields, config):
     if fields.get("email"):
         score += 1
     exp_cfg = config.get("experience", {})
-    lo, _hi = parse_experience_years(fields.get("experience") or text_lower)
+    lo, _hi = parse_experience_years(fields.get("experience") or text_lower, bool(fields.get("experience")))
     min_y, max_y = exp_cfg.get("min_years"), exp_cfg.get("max_years")
     if lo is not None and min_y is not None and max_y is not None and min_y <= lo <= max_y:
         score += 2
     return score
+
+
+PERMALINK_RE = re.compile(r"lnkd\.in/p/|linkedin\.com/(?:posts/|feed/update/)", re.IGNORECASE)
+
+
+def is_permalink(url):
+    """True for a link to the post itself (as captured via 'Copy link to
+    post'), as opposed to the poster's profile or the company page."""
+    return bool(url and PERMALINK_RE.search(url))
 
 
 def merge_duplicates(posts):
@@ -532,6 +695,10 @@ def merge_duplicates(posts):
             order.append(key)
         else:
             groups[key]["_urls"].append(p.get("post_url"))
+            # A repost may be the one whose permalink was captured; don't
+            # lose it just because another copy came first.
+            if is_permalink(p.get("post_url")) and not is_permalink(groups[key].get("post_url")):
+                groups[key]["post_url"] = p["post_url"]
             if not groups[key].get("company") and p.get("company"):
                 groups[key]["company"] = p["company"]
             for loc in p.get("locations", []):
@@ -548,16 +715,18 @@ def merge_duplicates(posts):
     return merged
 
 
-def process_posts(raw_posts, config):
+def process_posts(raw_posts, config, quiet=False):
     """Filter, extract structured fields from, and score a list of raw
     scraped posts (each a dict with at least 'text', 'company', 'post_url',
     'urn', 'age'). Returns the surviving posts, deduped by company+role.
+    quiet=True skips the summary log line (used for mid-scan probing).
     """
     exclude_keywords = config.get("exclude_keywords", [])
     exclude_role_prefixes = config.get("exclude_role_prefixes", [])
     exp_cfg = config.get("experience", {})
     foreign_signals = config.get("foreign_country_signals", FOREIGN_COUNTRY_SIGNALS)
     foreign_re = build_terms_regex(foreign_signals)
+    allow_foreign_remote = config.get("allow_foreign_remote", False)
     weak_foreign_re = build_terms_regex(config.get("foreign_weak_signals", []))
     scam_signals = config.get("scam_keywords", SCAM_KEYWORDS)
     scam_re = build_terms_regex(scam_signals)
@@ -606,7 +775,8 @@ def process_posts(raw_posts, config):
             drop_reasons["excluded_role_prefix"] += 1
             continue
 
-        exp_lo, exp_hi = parse_experience_years(fields.get("experience") or text)
+        exp_labeled = bool(fields.get("experience"))
+        exp_lo, exp_hi = parse_experience_years(fields.get("experience") or text, exp_labeled)
         max_years = exp_cfg.get("max_years")
         min_years = exp_cfg.get("min_years")
         if exp_lo is not None and max_years is not None and exp_lo > max_years:
@@ -619,9 +789,8 @@ def process_posts(raw_posts, config):
         # Conservative: a post that lists several roles/bands ("Junior 0-2
         # yrs ... Senior 5-8 yrs") is only dropped if EVERY stated band is
         # below the floor, so a mixed junior+senior post survives.
-        if min_years is not None and exp_hi is not None:
-            bands = [(int(a), int(b) if b else None)
-                     for a, b in EXP_RANGE_RE.findall(fields.get("experience") or text)]
+        if min_years is not None:
+            bands = experience_bands(fields.get("experience") or text, exp_labeled)
             if bands and all(hi is not None and hi < min_years for _lo, hi in bands):
                 drop_reasons["experience_too_low"] += 1
                 continue
@@ -635,7 +804,10 @@ def process_posts(raw_posts, config):
             # foreign if there's no Indian city/state to anchor the post.
             plain = strip_diacritics(loc_haystack)
             is_foreign = not any(rx.search(plain) for rx in STATE_REGEXES.values())
-        is_wfh_overseas = is_foreign and is_foreign_post_wfh(loc_haystack)
+        is_wfh_overseas = is_foreign and (
+            is_foreign_post_wfh(loc_haystack)
+            or (allow_foreign_remote and is_remote_post(loc_haystack))
+        )
         if is_foreign and not is_wfh_overseas:
             drop_reasons["foreign_not_wfh"] += 1
             continue
@@ -655,12 +827,15 @@ def process_posts(raw_posts, config):
         enriched["company"] = company
         enriched["location"] = location
         enriched["locations"] = locations
+        if is_foreign:
+            enriched["overseas_remote"] = True
+            enriched["remote_restriction"] = find_remote_restriction(text)
         experience = fields.get("experience", "")
         if not experience:
             # Narrative posts ("4+ years of hands-on experience...", a
             # "(3+ Years)" in the title) have no "Exp:" line - take the
             # stated years from the text so the report isn't blank.
-            exp_m = EXP_RANGE_RE.search(text)
+            exp_m = EXP_RANGE_RE.search(text) or EXP_MIN_RE.search(text)
             if exp_m:
                 experience = clean_field_value(exp_m.group(0))
         enriched["experience"] = experience
@@ -673,7 +848,7 @@ def process_posts(raw_posts, config):
         results.append(enriched)
 
     merged = merge_duplicates(results)
-    if raw_posts:
+    if raw_posts and not quiet:
         logging.info(
             "classify: %d raw -> %d kept (%d merged into existing) -> %d after dedup. Dropped: %s",
             len(raw_posts), len(results), len(results) - len(merged), len(merged),

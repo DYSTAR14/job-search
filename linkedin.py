@@ -34,6 +34,7 @@ import logging
 import random
 import re
 import time
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -187,6 +188,9 @@ MENU_BUTTON_SELECTOR = 'button[aria-label^="Open control menu"]'
 COPY_LINK_ITEM_SELECTOR = "text=/copy link to post/i"
 
 
+last_capture_failure = None  # why the most recent capture_post_permalink() returned None
+
+
 def capture_post_permalink(page, container):
     """Best-effort: open the post's '...' menu, click 'Copy link to post',
     and read the real permalink back from the clipboard. The menu item text
@@ -195,25 +199,48 @@ def capture_post_permalink(page, container):
     defensively and must never raise, since callers already have a working
     fallback link (company/author profile) from extract_post().
     """
+    global last_capture_failure
+    last_capture_failure = None
     try:
         menu_button = container.query_selector(MENU_BUTTON_SELECTOR)
         if not menu_button:
+            last_capture_failure = "no_menu_button"
             return None
-        menu_button.click()
-        page.wait_for_timeout(random.randint(400, 800))
+        # Live check 2026-10-30: clicking without scrolling the button into
+        # view first left the menu closed ~75% of the time, and "Copy link to
+        # post" needs ~0.4-0.9s to render after it opens.
+        menu_button.scroll_into_view_if_needed(timeout=4000)
+        page.wait_for_timeout(random.randint(600, 900))
+        menu_button.click(timeout=5000)
 
-        copy_item = page.query_selector(COPY_LINK_ITEM_SELECTOR)
+        copy_item = None
+        for _ in range(9):  # up to ~2.7s
+            page.wait_for_timeout(300)
+            copy_item = page.query_selector(COPY_LINK_ITEM_SELECTOR)
+            if copy_item:
+                break
         if not copy_item:
+            last_capture_failure = "menu_not_opened" if menu_button.get_attribute("aria-expanded") != "true" else "no_copy_item"
             page.keyboard.press("Escape")
             return None
-        copy_item.click()
-        page.wait_for_timeout(random.randint(300, 600))
 
-        link = page.evaluate("navigator.clipboard.readText()")
-        if link and link.strip().startswith("http"):
-            return link.strip()
+        # Clear the clipboard first so a stale copy (or something the user
+        # copied earlier) can never be mistaken for this post's link.
+        try:
+            page.evaluate("navigator.clipboard.writeText('')")
+        except Exception:
+            pass
+        copy_item.click(timeout=5000)
+
+        for _ in range(8):  # up to ~2.4s for the copy to land
+            page.wait_for_timeout(300)
+            link = (page.evaluate("navigator.clipboard.readText()") or "").strip()
+            if classify.is_permalink(link):
+                return link
+        last_capture_failure = "clipboard_not_permalink"
         return None
     except Exception as e:
+        last_capture_failure = "error"
         logging.debug("  permalink capture failed: %s", e)
         return None
     finally:
@@ -222,6 +249,16 @@ def capture_post_permalink(page, container):
         except Exception:
             pass
         time.sleep(random.uniform(2.0, 4.5))
+
+
+def _qkey(query):
+    """Case/whitespace-insensitive key for matching deep_queries to queries."""
+    return " ".join(str(query).lower().split())
+
+
+# Absolute scroll limits, applied on top of whatever config.yaml says.
+HARD_MAX_STEPS_PER_QUERY = 60
+HARD_MAX_STEPS_PER_RUN = 220
 
 
 class LinkedInScanner:
@@ -234,6 +271,13 @@ class LinkedInScanner:
         self.block_signals = config.get("block_signals", DEFAULT_BLOCK_SIGNALS)
         self.capture_post_links = config.get("capture_post_links", True)
         self.max_permalink_captures_per_query = config.get("max_permalink_captures_per_query", 15)
+
+    def _would_survive(self, post):
+        """True if the classifier would keep this post. Errors count as yes."""
+        try:
+            return bool(classify.process_posts([dict(post)], self.config, quiet=True))
+        except Exception:
+            return True
 
     def _launch(self, playwright):
         Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
@@ -316,8 +360,27 @@ class LinkedInScanner:
         scroll_max = pacing.get("scroll_delay_max", 9)
         query_min = pacing.get("query_delay_min", 20)
         query_max = pacing.get("query_delay_max", 40)
-        max_steps = pacing.get("max_scroll_steps", 30)
+        # Safety rails that no config value can exceed, so a typo in
+        # config.yaml can never turn into an endless or account-risky scroll.
+        max_steps = min(pacing.get("max_scroll_steps", 30), HARD_MAX_STEPS_PER_QUERY)
         stale_limit = pacing.get("stale_scroll_limit", 3)
+        # Dynamic depth: keep scrolling while recent scrolls still produce posts
+        # that survive the classifier, stop once they dry up. max_steps is only
+        # the per-query ceiling; run_scroll_budget bounds the whole run.
+        yield_window = pacing.get("yield_window", 3)
+        min_yield = pacing.get("min_useful_per_window", 1)
+        run_budget = min(pacing.get("run_scroll_budget", 110), HARD_MAX_STEPS_PER_RUN)
+        reserve_steps = pacing.get("reserve_steps_per_query", 4)
+        steps_used = 0
+        # Queries listed under deep_queries scroll until the results run out
+        # (or their own max_scroll_steps / max_posts), ignore the yield stop,
+        # and are counted apart from run_scroll_budget so they don't starve
+        # the other queries.
+        deep_cfg = {_qkey(k): (v or {}) for k, v in (self.config.get("deep_queries") or {}).items()}
+        deep_steps_used = 0
+        for name in deep_cfg:
+            if name not in {_qkey(q) for q in queries}:
+                logging.warning('deep_queries entry "%s" matches no query in "queries" - ignored', name)
 
         all_posts = []
         warnings = []
@@ -330,6 +393,8 @@ class LinkedInScanner:
                 block = None
                 seen_in_query = set()
                 permalink_captures_this_query = 0
+                permalink_ok_this_query = 0
+                capture_failures = Counter()
                 collected_before = len(all_posts)
                 logging.info('[%d/%d] "%s" -> loading search...', i + 1, len(queries), query)
                 try:
@@ -349,10 +414,32 @@ class LinkedInScanner:
                         break
 
                     stale_steps = 0
+                    recent_useful = []
+                    deep = _qkey(query) in deep_cfg  # listed = deep, even with no settings
+                    deep_max_posts = deep_cfg[_qkey(query)].get("max_posts") if deep else None
+                    if deep:
+                        ceiling = min(deep_cfg[_qkey(query)].get("max_scroll_steps", max_steps), HARD_MAX_STEPS_PER_QUERY)
+                        query_cap = ceiling
+                        budget_limited = False
+                    else:
+                        # Leave each later normal query enough steps to at least start.
+                        queries_left = sum(1 for q in queries[i + 1:] if _qkey(q) not in deep_cfg)
+                        query_cap = min(max_steps, max(reserve_steps, run_budget - steps_used - queries_left * reserve_steps))
+                        budget_limited = query_cap < max_steps
+                    query_cap = max(0, min(query_cap, HARD_MAX_STEPS_PER_RUN - steps_used - deep_steps_used))
+                    if query_cap == 0:
+                        warnings.append(f'Query "{query}" skipped: hard scroll limit for the run ({HARD_MAX_STEPS_PER_RUN}) reached')
+                        logging.warning("  hard scroll limit reached, skipping query")
+                        continue
 
-                    for step in range(max_steps):
+                    for step in range(query_cap):
+                        if deep:
+                            deep_steps_used += 1
+                        else:
+                            steps_used += 1
                         containers = page.query_selector_all(POST_CONTAINER_SELECTOR)
                         new_count = 0
+                        batch = []
                         hit_window_edge = False
 
                         for c in containers:
@@ -370,11 +457,21 @@ class LinkedInScanner:
                             if urn not in seen_urns:
                                 has_email = bool(classify.EMAIL_RE.search(post["text"]))
                                 under_cap = permalink_captures_this_query < self.max_permalink_captures_per_query
-                                if self.capture_post_links and not has_email and under_cap:
+                                # Spend the capped clicks only on posts that will
+                                # survive the filters; before this, ~60% of them
+                                # went to posts that were then dropped anyway.
+                                wants_capture = (
+                                    self.capture_post_links and not has_email and under_cap
+                                    and self._would_survive(post)
+                                )
+                                if wants_capture:
                                     real_link = capture_post_permalink(page, c)
                                     permalink_captures_this_query += 1
                                     if real_link:
                                         post["post_url"] = real_link
+                                        permalink_ok_this_query += 1
+                                    else:
+                                        capture_failures[last_capture_failure] += 1
                                     if permalink_captures_this_query == self.max_permalink_captures_per_query:
                                         logging.info(
                                             "  hit permalink capture cap (%d) for this query - "
@@ -383,10 +480,22 @@ class LinkedInScanner:
                                         )
                                 post["query"] = query
                                 all_posts.append(post)
+                                batch.append(post)
+
+                        try:
+                            useful = len(classify.process_posts([dict(b) for b in batch], self.config, quiet=True)) if batch else 0
+                        except Exception:
+                            useful = len(batch)  # can't judge -> don't stop early on a classifier error
+                        # A scroll whose cards were all seen in earlier runs says
+                        # nothing about how good the query is further down, so it
+                        # must not count toward the "dried up" stop (a same-day
+                        # re-run would otherwise stop before reaching new posts).
+                        if batch:
+                            recent_useful.append(useful)
 
                         logging.info(
-                            "  scroll %d/%d: +%d cards seen, %d kept so far",
-                            step + 1, max_steps, new_count, len(all_posts) - collected_before,
+                            "  scroll %d/%d: +%d cards seen, %d new (%d pass filters), %d kept so far",
+                            step + 1, query_cap, new_count, len(batch), useful, len(all_posts) - collected_before,
                         )
 
                         if hit_window_edge:
@@ -401,6 +510,25 @@ class LinkedInScanner:
                         else:
                             stale_steps = 0
 
+                        if deep_max_posts and len(all_posts) - collected_before >= deep_max_posts:
+                            logging.info("  reached max_posts (%d) for this deep query, stopping query", deep_max_posts)
+                            break
+
+                        if not deep and len(recent_useful) >= yield_window and sum(recent_useful[-yield_window:]) < min_yield:
+                            logging.info(
+                                "  last %d scrolls gave %d posts passing the filters (< %d), stopping query",
+                                yield_window, sum(recent_useful[-yield_window:]), min_yield,
+                            )
+                            break
+
+                        if step == query_cap - 1:
+                            continue  # last allowed read: scrolling again would load cards nobody reads
+
+                        # The results list scrolls inside its own container, and the
+                        # wheel only reaches it while the mouse is over it. (The
+                        # permalink-capture clicks used to move it there as a side
+                        # effect; without them the wheel scrolled nothing.)
+                        page.mouse.move(random.randint(520, 840), random.randint(380, 620))
                         page.mouse.wheel(0, 2000)
                         time.sleep(random.uniform(scroll_min, scroll_max))
 
@@ -410,19 +538,35 @@ class LinkedInScanner:
                             logging.warning("  BLOCKED mid-scroll: %s", block)
                             break
                     else:
-                        warnings.append(f'Query "{query}" hit the {max_steps}-step scroll cap')
-                        logging.info("  hit the %d-step scroll cap", max_steps)
+                        why = "run scroll budget" if budget_limited else "per-query ceiling"
+                        warnings.append(f'Query "{query}" stopped at {query_cap} scrolls ({why}) while still productive')
+                        logging.info("  hit the %d-step limit (%s) while still productive", query_cap, why)
 
                 except Exception as e:
                     warnings.append(f'Query "{query}" failed: {e}')
                     logging.exception("  ERROR on query \"%s\"", query)
 
+                no_results_page = False
                 if len(seen_in_query) == 0 and not block:
+                    try:
+                        no_results_page = "no results found" in page.inner_text("body").lower()
+                    except Exception:
+                        pass
+                if no_results_page:
+                    logging.info("  LinkedIn says 'No results found' for this query (not a scraping failure)")
+                elif len(seen_in_query) == 0 and not block:
                     debug_path = self._dump_debug(page, query, i)
                     if debug_path:
                         warnings.append(f'Zero cards matched for "{query}" - debug saved to {debug_path}.png/.html')
                         logging.warning("  zero cards matched selector - saved debug files to %s.png / .html", debug_path)
 
+                if permalink_captures_this_query:
+                    logging.info(
+                        "  post links captured: %d of %d attempts",
+                        permalink_ok_this_query, permalink_captures_this_query,
+                    )
+                    if capture_failures:
+                        logging.info("  capture failures: %s", dict(capture_failures))
                 logging.info("[%d/%d] done: %d new posts kept", i + 1, len(queries), len(all_posts) - collected_before)
 
                 if block:

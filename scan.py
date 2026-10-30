@@ -47,7 +47,7 @@ def setup_logging():
 
 CSV_COLUMNS = [
     "source", "company", "role", "location", "state_region", "experience",
-    "ctc", "notice_period", "work_mode", "job_type",
+    "ctc", "notice_period", "work_mode", "job_type", "remote_restriction",
     "email", "phone", "apply_url", "apply_type", "other_links", "how_to_apply",
     "apply_instruction", "age", "post_url", "score", "description",
 ]
@@ -195,6 +195,7 @@ def write_outputs(posts, warnings, window_hours):
                 "notice_period": p.get("notice_period", ""),
                 "work_mode": p.get("work_mode", ""),
                 "job_type": p.get("job_type", ""),
+                "remote_restriction": p.get("remote_restriction", ""),
                 "email": p.get("email", ""),
                 "phone": ", ".join(p.get("phones", [])),
                 "apply_url": p.get("apply_url", ""),
@@ -264,6 +265,13 @@ def write_outputs(posts, warnings, window_hours):
                 ]
                 if details:
                     f.write(f"- **Details:** {'  ·  '.join(details)}\n")
+                if p.get("overseas_remote"):
+                    note = p.get("remote_restriction")
+                    f.write(
+                        "- **Overseas remote job:** "
+                        + (f"⚠️ check eligibility — post says \"{note}\"" if note else "no residency or work-authorization wording found")
+                        + "\n"
+                    )
                 f.write(f"- **Posted:** {age_to_str(p.get('age')) or '—'} ago\n")
                 desc = (p.get("description") or "").strip()
                 if desc:

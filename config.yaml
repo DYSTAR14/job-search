@@ -22,7 +22,7 @@ capture_post_links: true
 # per-capture delay was widened to 2.0-4.5s in linkedin.py at the same time;
 # this cap shortens how long that rapid open-menu/copy-link/clipboard-read
 # pattern runs in total.
-max_permalink_captures_per_query: 8
+max_permalink_captures_per_query: 12
 
 # Once a job opening (keyed by contact email, or company+role if no email)
 # has been shown in the output, suppress it from showing again for this many
@@ -45,6 +45,24 @@ queries:
   - "hiring for mcp"
   - "hiring for langgraph"
   - "hiring for rag engineer"
+
+# Deep queries (names must match the list above exactly). These scroll until
+# the results run out - no new cards for stale_scroll_limit scrolls, or the
+# oldest visible post falls outside window_hours - instead of stopping when
+# the share of posts passing the filters drops. Limits per deep query:
+#   max_scroll_steps: scroll ceiling for this query (hard limit 60 in code)
+#   max_posts:        stop once this many new posts were collected
+# Deep scrolls are NOT counted in pacing.run_scroll_budget, so the other
+# queries keep their own budget; code still caps the whole run at 220 scrolls.
+# More scrolling is more account activity - see the block-risk note at the
+# pacing section.
+deep_queries:
+  "hiring for java developer":
+    max_scroll_steps: 50
+    max_posts: 500
+  "hiring for agentic ai":
+    max_scroll_steps: 50
+    max_posts: 500
 
 # Both ends are enforced: a post whose lowest stated requirement is above
 # max_years is dropped (too senior), and one whose highest stated
@@ -84,6 +102,15 @@ exclude_keywords:
 # through before, since "remote within Canada" also says "remote"; it needs
 # an explicit WFH phrase, or "remote" combined with an explicit India
 # mention). See is_foreign_post_wfh() in classify.py.
+#
+# allow_foreign_remote (added 2026-10-30): when true, a foreign post is ALSO
+# kept if it is a remote job ("fully remote within Europe", "remote - Canada")
+# - it is shown under "Remote (International)" with a note if the post
+# mentions residency / work-authorization / time-zone wording. Foreign
+# on-site and hybrid posts are still dropped, and so are c2c / w2 / h1b posts
+# (exclude_keywords) - those are US-employment arrangements.
+allow_foreign_remote: true
+
 foreign_country_signals:
   - usa only
   - usa
@@ -114,6 +141,8 @@ foreign_country_signals:
   - uk
   - london
   - germany
+  - europe
+  - emea
   - berlin
   - australia
   - sydney
@@ -206,6 +235,7 @@ exclude_role_keywords:
   - php
   - ruby
   - golang
+  - rust
   - c#
   - angular
   - react
@@ -258,6 +288,12 @@ exclude_role_prefixes:
   - lead
   - manager
   - architect
+  - junior
+  - jr.
+  - jr 
+  - trainee
+  - fresher
+  - internship
 
 # Location filtering is now handled in code (classify.py's STATE_PATTERNS +
 # foreign_country_signals above), covering all Indian states/UTs plus the
@@ -286,8 +322,19 @@ pacing:
   scroll_delay_max: 9
   query_delay_min: 20
   query_delay_max: 40
-  max_scroll_steps: 15
+  # Dynamic depth (2026-10-27): max_scroll_steps is now only a per-query
+  # ceiling. A query keeps scrolling while the last yield_window scrolls gave
+  # at least min_useful_per_window posts that pass classify.py's filters, and
+  # stops as soon as they dry up. run_scroll_budget caps total scrolls per
+  # run (the 10-27 run used 90 at a fixed 15) so daily volume stays bounded -
+  # the cumulative-activity signal described above - while the steps saved on
+  # dried-up queries go to the ones that are still productive.
+  max_scroll_steps: 25
   stale_scroll_limit: 3
+  yield_window: 4
+  min_useful_per_window: 1
+  run_scroll_budget: 120
+  reserve_steps_per_query: 6
 
 # Phrases checked (case-insensitive) against the full page text after every
 # navigation/scroll. Any match stops the run immediately.
